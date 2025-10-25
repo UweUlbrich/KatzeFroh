@@ -3,6 +3,77 @@
 #include <time.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <SPIFFS.h>
+
+// forward declare server (defined later) so handlers above can use it
+extern WebServer server;
+
+// Logging helpers
+String getCurrentTimestamp() {
+  // Placeholder: return a formatted timestamp. If time is available via time(), format it.
+  time_t now = time(nullptr);
+  struct tm t;
+  if (localtime_r(&now, &t)) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+    return String(buf);
+  }
+  // Fallback dummy timestamp
+  return String("1970-01-01 00:00:00");
+}
+
+void logMessage(String level, String message) {
+  // Rotate if needed before writing
+  const size_t MAX_LOG_SIZE = 64 * 1024; // 64 KB
+  if (SPIFFS.exists("/log.txt")) {
+    File fchk = SPIFFS.open("/log.txt", FILE_READ);
+    if (fchk) {
+      size_t sz = fchk.size();
+      fchk.close();
+      if (sz >= MAX_LOG_SIZE) {
+        // rotate: /log.3.txt <- /log.2.txt <- /log.1.txt <- /log.txt
+        for (int i = 3; i >= 1; --i) {
+          String src = i == 1 ? "/log.txt" : String("/log.") + (i-1) + ".txt";
+          String dst = String("/log.") + i + ".txt";
+          if (SPIFFS.exists(dst)) SPIFFS.remove(dst);
+          if (SPIFFS.exists(src)) SPIFFS.rename(src.c_str(), dst.c_str());
+        }
+      }
+    }
+  }
+  String ts = getCurrentTimestamp();
+  String line = "[" + ts + "] [" + level + "] " + message + "\n";
+  // Write to serial
+  Serial.print(line);
+  // Append to SPIFFS file
+  File f = SPIFFS.open("/log.txt", FILE_APPEND);
+  if (!f) {
+    Serial.println("ERROR: failed to open log file for appending");
+    return;
+  }
+  size_t written = f.print(line);
+  if (written == 0) {
+    Serial.println("ERROR: failed to write to log file");
+  }
+  f.close();
+}
+
+// Serve log file at /log
+void handleLogDownload() {
+  if (!SPIFFS.exists("/log.txt")) {
+    server.send(404, "text/plain", "Log not found");
+    return;
+  }
+  File f = SPIFFS.open("/log.txt", FILE_READ);
+  if (!f) {
+    server.send(500, "text/plain", "Failed to open log");
+    return;
+  }
+  server.streamFile(f, "text/plain");
+  f.close();
+}
 
 // Blink the onboard LED of the AZ-Delivery / Wemos D1 Mini ESP32
 // On many ESP32 D1 mini boards the onboard LED is connected to GPIO 2.
@@ -57,7 +128,8 @@ void startScheduledRun();
 void stopMotor();
 void startConfigPortal();
 void handleRoot();
-void handleSave();
+void handleWifiRoot();
+void handleWifiSave();
 void setRelayActive();
 void setRelayInactive();
 void handleConfigRoot();
@@ -83,9 +155,16 @@ void setup() {
   setRelayInactive();
   delay(20);
   Serial.begin(115200);
-  delay(100);
+  delay(200);
+  // Initialize SPIFFS so we can log to file
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+  } else {
+    // SPIFFS ready; will log this below using logMessage
+  }
+  
   if (RUN_SELF_TEST) {
-    Serial.println("Relay self-test: activating briefly (2 cycles)");
+    logMessage("INFO", "Relay self-test: activating briefly (2 cycles)");
     setRelayActive();
     delay(2000);
     setRelayInactive();
@@ -104,7 +183,7 @@ void setup() {
   // Relay pin (disabled for testing)
   // pinMode(RELAY_PIN, OUTPUT);
   // digitalWrite(RELAY_PIN, HIGH); // start with relay ON (HIGH)
-  Serial.println("Example started");
+  logMessage("INFO", "Example started");
 }
 
 // --- State used across functions ---
@@ -123,23 +202,27 @@ void setupPins() {
   // Relay pin
   pinMode(RELAY_PIN, OUTPUT);
   setRelayInactive(); // ensure relay inactive after setup
-  Serial.println("Pins initialized");
+  logMessage("INFO", "Pins initialized");
 }
 
 // Read the switch with debounce and count rising edges. Returns true if a rising edge was detected.
 bool readSwitchRisingEdge() {
   const unsigned long debounceDelay = 50; // ms
   int reading = digitalRead(SWITCH_PIN);
+  // char buf[64];
 
   if (reading != lastReading) {
-    Serial.printf("Switch changed raw -> %d\n", reading);
+    // char buf[32];
+    // snprintf(buf, sizeof(buf), "Switch changed raw -> %d", reading);
+    // logMessage("DEBUG", String(buf));
     lastDebounceTime = millis();
   }
 
   if ((millis() - lastDebounceTime) > debounceDelay) {
     if (reading != stableState) {
       stableState = reading;
-      Serial.printf("Switch stable -> %d\n", stableState);
+      // snprintf(buf, sizeof(buf), "Switch stable -> %d", stableState);
+      // logMessage("DEBUG", String(buf));
       if (stableState == HIGH) {
         // rising edge
         lastReading = reading;
@@ -155,11 +238,11 @@ bool readSwitchRisingEdge() {
 // Start a manual relay pulse if not already active and not in a scheduled run
 void startRelayPulse() {
   if (!ENABLE_MANUAL_TRIGGER) {
-    Serial.println("Manual trigger disabled in configuration");
+    logMessage("INFO", "Manual trigger disabled in configuration");
     return;
   }
   if (motorRunActive) {
-    Serial.println("Manual pulse requested but scheduled run active - ignoring");
+    logMessage("INFO", "Manual pulse requested but scheduled run active - ignoring");
     return;
   }
   // respect cooldown after motor stop
@@ -168,12 +251,12 @@ void startRelayPulse() {
     return;
   }
   if (!relayPulseActive) {
-    Serial.println("3 presses reached -> activating manual relay pulse (LOW for configured time)");
+    logMessage("INFO", "3 presses reached -> activating manual relay pulse (LOW for configured time)");
   setRelayActive();
     relayPulseActive = true;
     relayPulseStart = millis();
   } else {
-    Serial.println("3 presses reached but manual relay pulse already active");
+    logMessage("INFO", "3 presses reached but manual relay pulse already active");
   }
 }
 
@@ -184,14 +267,14 @@ void updateRelayPulse() {
     if ((millis() - relayPulseStart) >= RELAY_PULSE_MS) {
   setRelayInactive();
       relayPulseActive = false;
-      Serial.println("Manual relay pulse ended, relay set HIGH (inactive)");
+      logMessage("INFO", "Manual relay pulse ended, relay set HIGH (inactive)");
       lastMotorStop = millis();
     }
   }
   // Scheduled run timeout check
   if (motorRunActive && scheduledRunStart > 0) {
     if ((millis() - scheduledRunStart) >= SCHEDULED_RUN_MAX_MS) {
-      Serial.println("Scheduled run timeout reached - stopping motor as failsafe");
+      logMessage("WARN", "Scheduled run timeout reached - stopping motor as failsafe");
       stopMotor();
       lastMotorStop = millis();
     }
@@ -204,6 +287,7 @@ void updateLed() {
 }
 
 void loop() {
+  char buf[64];
   // Periodically check schedule at a resolution of 1 minute
   checkSchedule();
 
@@ -212,19 +296,21 @@ void loop() {
     // If a scheduled motor run is active, count towards scheduledPressCount
     if (motorRunActive) {
       scheduledPressCount++;
-      Serial.printf("Scheduled run: switch rising edge, scheduled count=%d\n", scheduledPressCount);
+  snprintf(buf, sizeof(buf), "Scheduled run: switch rising edge, scheduled count=%d", scheduledPressCount);
+  logMessage("DEBUG", String(buf));
       // When enough presses during a scheduled run are detected, stop motor
       if (scheduledPressCount >= currentScheduleSteps) {
-        Serial.println("Scheduled run completed: stopping motor/relay");
+        logMessage("INFO", "Scheduled run completed: stopping motor/relay");
         // Ensure relay is deactivated
         stopMotor();
       }
     } else {
       if (ENABLE_MANUAL_TRIGGER) {
         pressCount++;
-        Serial.printf("Switch rising edge detected, count=%d\n", pressCount);
+  snprintf(buf, sizeof(buf), "Switch rising edge detected, count=%d", pressCount);
+  logMessage("DEBUG", String(buf));
       } else {
-        Serial.println("Switch rising edge ignored (manual trigger disabled)");
+        logMessage("DEBUG", "Switch rising edge ignored (manual trigger disabled)");
       }
     }
   }
@@ -252,48 +338,49 @@ void connectToWiFi() {
   prefs.end();
 
   if (storedSsid.length() > 0) {
-    Serial.printf("Found stored credentials SSID=%s\n", storedSsid.c_str());
+    logMessage("DEBUG", String("Found stored credentials SSID=") + storedSsid);
     WiFi.mode(WIFI_STA);
     WiFi.begin(storedSsid.c_str(), storedPass.c_str());
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
       delay(200);
-      Serial.print('.');
+    // progress dot while connecting
+    logMessage("DEBUG", ".");
     }
-    Serial.println();
+  logMessage("DEBUG", "");
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("WiFi connected (stored credentials)");
-      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+      logMessage("INFO", "WiFi connected (stored credentials)");
+      logMessage("INFO", String("IP: ") + WiFi.localIP().toString());
       return;
     } else {
-      Serial.println("Stored credentials didn't connect");
+      logMessage("WARN", "Stored credentials didn't connect");
     }
   }
 
   // Next try compile-time credentials if provided
   if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_SSID") != 0) {
-    Serial.printf("Trying compile-time credentials SSID=%s\n", WIFI_SSID);
+  logMessage("DEBUG", String("Trying compile-time credentials SSID=") + WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     unsigned long start2 = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - start2) < 10000) {
       delay(200);
-      Serial.print('.');
+    logMessage("DEBUG", ".");
     }
-    Serial.println();
+  logMessage("DEBUG", "");
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("WiFi connected (compile-time credentials)");
-      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+      logMessage("INFO", "WiFi connected (compile-time credentials)");
+      logMessage("INFO", String("IP: ") + WiFi.localIP().toString());
       return;
     } else {
-      Serial.println("Compile-time credentials didn't connect");
+      logMessage("WARN", "Compile-time credentials didn't connect");
     }
   }
 
   // If we got here, no usable credentials or connection failed -> log and continue.
   // The configuration portal is started unconditionally from setup() and will be
   // reachable on the device IP (STA when connected, AP when not).
-  Serial.println("No usable WiFi connection at this time (portal runs in background)");
+  logMessage("WARN", "No usable WiFi connection at this time (portal runs in background)");
 }
 
 // Start the config portal in a non-blocking way. The server will be started and
@@ -303,9 +390,14 @@ void startConfigPortal() {
   if (configPortalRunning) return;
 
   server.on("/", HTTP_GET, handleRoot);
+  // Root should show the schedule page; keep /config as alias
+  server.on("/", HTTP_GET, handleConfigRoot);
   server.on("/config", HTTP_GET, handleConfigRoot);
   server.on("/config/save", HTTP_POST, handleConfigSave);
-  server.on("/save", HTTP_POST, handleSave);
+  // WiFi setup moved to /wifi
+  server.on("/wifi", HTTP_GET, handleWifiRoot);
+  server.on("/wifi/save", HTTP_POST, handleWifiSave);
+  server.on("/log", HTTP_GET, handleLogDownload);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
 
   server.begin();
@@ -313,21 +405,22 @@ void startConfigPortal() {
 
   if (WiFi.status() != WL_CONNECTED) {
     const char* apName = "KatzeFroh-Setup";
-    Serial.printf("Starting AP '%s'\n", apName);
+  logMessage("INFO", String("Starting AP '") + apName + "'");
     WiFi.mode(WIFI_AP);
     WiFi.softAP(apName);
     IPAddress apIP = WiFi.softAPIP();
-    Serial.printf("AP IP: %s\n", apIP.toString().c_str());
-    Serial.println("Config portal started on AP. Connect and open http://192.168.4.1/");
+  logMessage("INFO", String("AP IP: ") + apIP.toString());
+  logMessage("INFO", "Config portal started on AP. Connect and open http://192.168.4.1/");
   } else {
-    Serial.printf("Config portal started on STA IP: %s\n", WiFi.localIP().toString().c_str());
+  logMessage("INFO", String("Config portal started on STA IP: ") + WiFi.localIP().toString());
   }
 }
 
 // Handlers use Preferences to save credentials.
-void handleRoot() {
+void handleWifiRoot() {
   String page = "<html><body><h2>KatzeFroh WiFi Setup</h2>";
-  page += "<form method='POST' action='/save'>";
+  // post to /wifi/save (route moved)
+  page += "<form method='POST' action='/wifi/save'>";
   page += "SSID: <input name='ssid' length=32><br>";
   page += "Password: <input name='pass' length=64><br>";
   page += "<input type='submit' value='Save'>";
@@ -375,7 +468,7 @@ void handleRoot() {
     Serial.println("Relay set INACTIVE (LOW)");
   }
 
-void handleSave() {
+void handleWifiSave() {
   if (!server.hasArg("ssid")) {
     server.send(400, "text/plain", "ssid missing");
     return;
@@ -403,7 +496,9 @@ void initTime() {
   }
   struct tm timeinfo;
   if (localtime_r(&now, &timeinfo)) {
-    Serial.printf("Current time: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    char tbuf[64];
+    snprintf(tbuf, sizeof(tbuf), "Current time: %02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    logMessage("INFO", String(tbuf));
   }
 }
 
@@ -423,7 +518,9 @@ void checkSchedule() {
     if (schedule[i].hour == curHour && schedule[i].minute == curMinute) {
       int today = timeinfo.tm_yday; // day of year
       if (schedule[i].lastTriggeredDay != today) {
-        Serial.printf("Scheduled time reached: %02d:%02d -> starting motor run\n", curHour, curMinute);
+  char schedBuf[64];
+  snprintf(schedBuf, sizeof(schedBuf), "Scheduled time reached: %02d:%02d -> starting motor run", curHour, curMinute);
+  logMessage("INFO", String(schedBuf));
         currentScheduleIndex = i;
         startScheduledRun();
         schedule[i].lastTriggeredDay = today;
@@ -471,12 +568,24 @@ void loadScheduleFromPrefs() {
 }
 
 void handleConfigRoot() {
-  String page = "<html><body><h2>Feeding schedule</h2><form method='POST' action='/config/save'>";
+  String page = "<html><body><h2>KatzeFroh - Zeitplan</h2><form method='POST' action='/config/save'>";
   for (int i = 0; i < 3; ++i) {
     page += "Zeit " + String(i+1) + ": <input name='h" + String(i) + "' size=2 value='" + String(schedule[i].hour) + "'>:";
     page += "<input name='m" + String(i) + "' size=2 value='" + String(schedule[i].minute) + "'> ";
-    page += "Schritte: <input name='s" + String(i) + "' size=2 value='" + String(schedule[i].steps) + "'><br>";
+    page += "Portionen: <input name='s" + String(i) + "' size=2 value='" + String(schedule[i].steps) + "'><br>";
   }
   page += "<input type='submit' value='Save'></form></body></html>";
+  page += "<p><a href='/wifi'>WiFi konfigurieren</a></p>";
+  server.send(200, "text/html", page);
+}
+
+// Root page: links to schedule config and WiFi setup
+void handleRoot() {
+  String page = "<html><body><h2>KatzeFroh</h2>";
+  page += "<ul>";
+  page += "<li><a href='/config'>Zeitplan konfigurieren</a></li>";
+  page += "<li><a href='/wifi'>WLAN konfigurieren</a></li>";
+  page += "</ul>";
+  page += "</body></html>";
   server.send(200, "text/html", page);
 }
