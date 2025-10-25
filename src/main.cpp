@@ -20,8 +20,8 @@ const uint8_t STEPS_PER_RUN = 3; // how many switch activations per scheduled mo
 
 // WiFi / NTP (fill these)
 const char* WIFI_SSID = "FRITZ6.3";
-const char* WIFI_PASS = "Cool:home::";
-const long GMT_OFFSET_SEC = 0; // adjust to your timezone (seconds)
+const char* WIFI_PASS = "Cool2:home::";
+const long GMT_OFFSET_SEC = 7200; // adjust to your timezone (seconds)
 const int DAYLIGHT_OFFSET_SEC = 0;
 
 // Scheduled times (hour, minute)
@@ -170,6 +170,10 @@ void loop() {
 
 // Connect to WiFi (non-blocking wait)
 void connectToWiFi() {
+  if (strlen(WIFI_SSID) == 0 || strcmp(WIFI_SSID, "YOUR_SSID") == 0) {
+    Serial.println("WiFi SSID not configured. Please set WIFI_SSID and WIFI_PASS in src/main.cpp");
+    return;
+  }
   Serial.printf("Connecting to WiFi SSID=%s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -181,8 +185,16 @@ void connectToWiFi() {
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi connected");
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
   } else {
     Serial.println("WiFi not connected (continuing without time sync)");
+    // Do a quick scan and print nearby SSIDs to help diagnose
+    int n = WiFi.scanNetworks();
+    Serial.printf("Found %d networks:\n", n);
+    for (int i = 0; i < n; ++i) {
+      Serial.printf("  %d: %s (RSSI=%d) %s\n", i, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "SECURE");
+    }
+    WiFi.scanDelete();
   }
 }
 
