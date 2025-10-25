@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
 
 // Blink the onboard LED of the AZ-Delivery / Wemos D1 Mini ESP32
 // On many ESP32 D1 mini boards the onboard LED is connected to GPIO 2.
@@ -12,8 +14,33 @@ const uint8_t SWITCH_PIN = 32;   // change to the GPIO where your switch is conn
 const uint8_t RELAY_PIN = 22;   // relay pin set to GPIO22 (active LOW)
 
 // Configuration
-const unsigned long RELAY_PULSE_MS = 2000UL; // relay active time in ms (2s)
+const unsigned long RELAY_PULSE_MS = 5000UL; // relay active time in ms (2s)
 const uint8_t REQUIRED_PRESSES = 3; // how many rising edges trigger the relay
+const uint8_t STEPS_PER_RUN = 3; // how many switch activations per scheduled motor run
+
+// WiFi / NTP (fill these)
+const char* WIFI_SSID = "FRITZ6.3";
+const char* WIFI_PASS = "Cool:home::";
+const long GMT_OFFSET_SEC = 0; // adjust to your timezone (seconds)
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+// Scheduled times (hour, minute)
+struct ScheduledTime { uint8_t hour; uint8_t minute; int lastTriggeredDay; };
+ScheduledTime schedule[3] = {
+  {8, 0, -1},
+  {13, 0, -1},
+  {18, 0, -1}
+};
+
+// Scheduler state
+static bool motorRunActive = false; // true when motor running for scheduled job
+static int scheduledPressCount = 0; // counts switch activations during scheduled run
+static int lastCheckedMinute = -1;
+
+// Function prototypes (extended)
+void connectToWiFi();
+void initTime();
+void checkSchedule();
 
 // Function prototypes
 void setupPins();
@@ -26,6 +53,8 @@ void setup() {
   Serial.begin(115200);
   delay(10);
   setupPins();
+  connectToWiFi();
+  initTime();
   // Relay pin (disabled for testing)
   // pinMode(RELAY_PIN, OUTPUT);
   // digitalWrite(RELAY_PIN, HIGH); // start with relay ON (HIGH)
@@ -105,10 +134,27 @@ void updateLed() {
 }
 
 void loop() {
+  // Periodically check schedule at a resolution of 1 minute
+  checkSchedule();
+
   // Read switch and handle rising edge counter
   if (readSwitchRisingEdge()) {
-    pressCount++;
-    Serial.printf("Switch rising edge detected, count=%d\n", pressCount);
+    // If a scheduled motor run is active, count towards scheduledPressCount
+    if (motorRunActive) {
+      scheduledPressCount++;
+      Serial.printf("Scheduled run: switch rising edge, scheduled count=%d\n", scheduledPressCount);
+      // When enough presses during a scheduled run are detected, stop motor
+      if (scheduledPressCount >= STEPS_PER_RUN) {
+        Serial.println("Scheduled run completed: stopping motor/relay");
+        // Ensure relay is deactivated
+        digitalWrite(RELAY_PIN, HIGH);
+        motorRunActive = false;
+        scheduledPressCount = 0;
+      }
+    } else {
+      pressCount++;
+      Serial.printf("Switch rising edge detected, count=%d\n", pressCount);
+    }
   }
 
   // If enough presses, start relay pulse and reset counter
@@ -120,4 +166,68 @@ void loop() {
   // Update relay pulse state and LED
   updateRelayPulse();
   updateLed();
+}
+
+// Connect to WiFi (non-blocking wait)
+void connectToWiFi() {
+  Serial.printf("Connecting to WiFi SSID=%s\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
+    delay(200);
+    Serial.print('.');
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+  } else {
+    Serial.println("WiFi not connected (continuing without time sync)");
+  }
+}
+
+// Initialize time via SNTP (if WiFi is connected)
+void initTime() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
+  Serial.println("Waiting for time sync...");
+  time_t now = time(nullptr);
+  unsigned long start = millis();
+  while (now < 8 * 3600 * 2 && (millis() - start) < 10000) {
+    delay(200);
+    now = time(nullptr);
+  }
+  struct tm timeinfo;
+  if (localtime_r(&now, &timeinfo)) {
+    Serial.printf("Current time: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  }
+}
+
+// Check the schedule once per minute and start motor run when scheduled time is reached
+void checkSchedule() {
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  if (!localtime_r(&now, &timeinfo)) return;
+  int curMinute = timeinfo.tm_min;
+  int curHour = timeinfo.tm_hour;
+
+  // Only check when minute changed to avoid repeated triggers within the same minute
+  if (curMinute == lastCheckedMinute) return;
+  lastCheckedMinute = curMinute;
+
+  for (int i = 0; i < 3; ++i) {
+    if (schedule[i].hour == curHour && schedule[i].minute == curMinute) {
+      int today = timeinfo.tm_yday; // day of year
+      if (schedule[i].lastTriggeredDay != today) {
+        Serial.printf("Scheduled time reached: %02d:%02d -> starting motor run\n", curHour, curMinute);
+        // Start motor: activate relay
+        digitalWrite(RELAY_PIN, LOW); // active LOW
+        motorRunActive = true;
+        scheduledPressCount = 0;
+        schedule[i].lastTriggeredDay = today;
+      } else {
+        Serial.println("Scheduled time already triggered today");
+      }
+    }
+  }
 }
