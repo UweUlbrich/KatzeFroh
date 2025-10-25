@@ -43,6 +43,8 @@ static int lastCheckedMinute = -1;
 void connectToWiFi();
 void initTime();
 void checkSchedule();
+void startScheduledRun();
+void stopMotor();
 void startConfigPortal();
 void handleRoot();
 void handleSave();
@@ -110,25 +112,30 @@ bool readSwitchRisingEdge() {
   return false;
 }
 
-// Start a relay pulse if not already active
+// Start a manual relay pulse if not already active and not in a scheduled run
 void startRelayPulse() {
+  if (motorRunActive) {
+    Serial.println("Manual pulse requested but scheduled run active - ignoring");
+    return;
+  }
   if (!relayPulseActive) {
-    Serial.println("3 presses reached -> activating relay (LOW for configured time)");
+    Serial.println("3 presses reached -> activating manual relay pulse (LOW for configured time)");
     digitalWrite(RELAY_PIN, LOW); // active LOW
     relayPulseActive = true;
     relayPulseStart = millis();
   } else {
-    Serial.println("3 presses reached but relay pulse already active");
+    Serial.println("3 presses reached but manual relay pulse already active");
   }
 }
 
 // Check and update relay pulse (non-blocking)
 void updateRelayPulse() {
-  if (relayPulseActive) {
+  // Only auto-manage manual pulses when not in a scheduled run
+  if (relayPulseActive && !motorRunActive) {
     if ((millis() - relayPulseStart) >= RELAY_PULSE_MS) {
       digitalWrite(RELAY_PIN, HIGH); // deactivate relay
       relayPulseActive = false;
-      Serial.println("Relay pulse ended, relay set HIGH (inactive)");
+      Serial.println("Manual relay pulse ended, relay set HIGH (inactive)");
     }
   }
 }
@@ -346,14 +353,30 @@ void checkSchedule() {
       int today = timeinfo.tm_yday; // day of year
       if (schedule[i].lastTriggeredDay != today) {
         Serial.printf("Scheduled time reached: %02d:%02d -> starting motor run\n", curHour, curMinute);
-        // Start motor: activate relay
-        digitalWrite(RELAY_PIN, LOW); // active LOW
-        motorRunActive = true;
-        scheduledPressCount = 0;
+        startScheduledRun();
         schedule[i].lastTriggeredDay = today;
       } else {
         Serial.println("Scheduled time already triggered today");
       }
     }
   }
+}
+
+void startScheduledRun() {
+  if (motorRunActive) {
+    Serial.println("Scheduled run requested but motor already running");
+    return;
+  }
+  Serial.println("Starting scheduled motor run: activating relay");
+  digitalWrite(RELAY_PIN, LOW); // active LOW keeps motor running
+  motorRunActive = true;
+  scheduledPressCount = 0;
+}
+
+void stopMotor() {
+  Serial.println("Stopping motor (relay HIGH)");
+  digitalWrite(RELAY_PIN, HIGH);
+  motorRunActive = false;
+  scheduledPressCount = 0;
+  relayPulseActive = false;
 }
