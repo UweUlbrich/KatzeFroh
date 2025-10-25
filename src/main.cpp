@@ -35,16 +35,18 @@ const long GMT_OFFSET_SEC = 7200; // adjust to your timezone (seconds)
 const int DAYLIGHT_OFFSET_SEC = 0;
 
 // Scheduled times (hour, minute)
-struct ScheduledTime { uint8_t hour; uint8_t minute; int lastTriggeredDay; };
+struct ScheduledTime { uint8_t hour; uint8_t minute; uint8_t steps; int lastTriggeredDay; };
 ScheduledTime schedule[3] = {
-  {8, 0, -1},
-  {16, 40, -1},
-  {18, 0, -1}
+  {8, 0, 3, -1},
+  {16, 40, 3, -1},
+  {18, 0, 3, -1}
 };
 
 // Scheduler state
 static bool motorRunActive = false; // true when motor running for scheduled job
 static int scheduledPressCount = 0; // counts switch activations during scheduled run
+static int currentScheduleIndex = -1; // which schedule entry is running
+static int currentScheduleSteps = 0; // steps required for current scheduled run
 static int lastCheckedMinute = -1;
 
 // Function prototypes (extended)
@@ -58,6 +60,10 @@ void handleRoot();
 void handleSave();
 void setRelayActive();
 void setRelayInactive();
+void handleConfigRoot();
+void handleConfigSave();
+void loadScheduleFromPrefs();
+void saveScheduleToPrefs();
 
 // Function prototypes
 void setupPins();
@@ -65,6 +71,10 @@ bool readSwitchRisingEdge();
 void startRelayPulse();
 void updateRelayPulse();
 void updateLed();
+
+// Global web server instance for config portal
+WebServer server(80);
+static bool configPortalRunning = false;
 
 void setup() {
   // Initialize relay pin as early as possible to avoid accidental activation during boot
@@ -87,6 +97,10 @@ void setup() {
   setupPins();
   connectToWiFi();
   initTime();
+  // Load any saved schedule from Preferences before starting portal
+  loadScheduleFromPrefs();
+  // Start the configuration portal (non-blocking) so it's always reachable
+  startConfigPortal();
   // Relay pin (disabled for testing)
   // pinMode(RELAY_PIN, OUTPUT);
   // digitalWrite(RELAY_PIN, HIGH); // start with relay ON (HIGH)
@@ -200,7 +214,7 @@ void loop() {
       scheduledPressCount++;
       Serial.printf("Scheduled run: switch rising edge, scheduled count=%d\n", scheduledPressCount);
       // When enough presses during a scheduled run are detected, stop motor
-      if (scheduledPressCount >= STEPS_PER_RUN) {
+      if (scheduledPressCount >= currentScheduleSteps) {
         Serial.println("Scheduled run completed: stopping motor/relay");
         // Ensure relay is deactivated
         stopMotor();
@@ -224,6 +238,8 @@ void loop() {
   // Update relay pulse state and LED
   updateRelayPulse();
   updateLed();
+  // Serve config portal requests (non-blocking)
+  if (configPortalRunning) server.handleClient();
 }
 
 // Connect to WiFi (non-blocking wait)
@@ -274,68 +290,37 @@ void connectToWiFi() {
     }
   }
 
-  // If we got here, no usable credentials or connection failed -> start config portal
-  Serial.println("Starting AP config portal to set WiFi credentials");
-  startConfigPortal();
+  // If we got here, no usable credentials or connection failed -> log and continue.
+  // The configuration portal is started unconditionally from setup() and will be
+  // reachable on the device IP (STA when connected, AP when not).
+  Serial.println("No usable WiFi connection at this time (portal runs in background)");
 }
 
-// Global web server instance for config portal
-WebServer server(80);
-
-// Simple captive-style AP web portal to enter WiFi credentials
+// Start the config portal in a non-blocking way. The server will be started and
+// the AP will be created if the ESP is not connected to WiFi. Handlers are
+// registered here and `server.handleClient()` must be called from loop().
 void startConfigPortal() {
-  const char* apName = "KatzeFroh-Setup";
-  Serial.printf("Starting AP '%s'\n", apName);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(apName);
-  IPAddress apIP = WiFi.softAPIP();
-  Serial.printf("AP IP: %s\n", apIP.toString().c_str());
+  if (configPortalRunning) return;
 
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/config", HTTP_GET, handleConfigRoot);
+  server.on("/config/save", HTTP_POST, handleConfigSave);
   server.on("/save", HTTP_POST, handleSave);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
 
-  // Start server and handle requests until credentials saved
   server.begin();
-  Serial.println("Config portal started. Connect to the AP and open http://192.168.4.1/");
+  configPortalRunning = true;
 
-  unsigned long portalStart = millis();
-  bool saved = false;
-  while (!saved && (millis() - portalStart) < 300000) { // 5 minutes
-    server.handleClient();
-    delay(10);
-    // check a flag in Preferences to see if saved
-    Preferences prefs;
-    prefs.begin("wifi", true);
-    String ssid = prefs.getString("ssid", "");
-    prefs.end();
-    if (ssid.length() > 0) saved = true;
-  }
-
-  server.stop();
-  Serial.println("Config portal stopped");
-  // attempt to reconnect if saved
-  Preferences prefs2;
-  prefs2.begin("wifi", true);
-  String newSsid = prefs2.getString("ssid", "");
-  String newPass = prefs2.getString("pass", "");
-  prefs2.end();
-  if (newSsid.length() > 0) {
-    Serial.printf("Trying new credentials SSID=%s\n", newSsid.c_str());
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(newSsid.c_str(), newPass.c_str());
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
-      delay(200);
-      Serial.print('.');
-    }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("WiFi connected (new credentials)");
-      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-    } else {
-      Serial.println("New credentials failed to connect");
-    }
+  if (WiFi.status() != WL_CONNECTED) {
+    const char* apName = "KatzeFroh-Setup";
+    Serial.printf("Starting AP '%s'\n", apName);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(apName);
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.printf("AP IP: %s\n", apIP.toString().c_str());
+    Serial.println("Config portal started on AP. Connect and open http://192.168.4.1/");
+  } else {
+    Serial.printf("Config portal started on STA IP: %s\n", WiFi.localIP().toString().c_str());
   }
 }
 
@@ -349,6 +334,46 @@ void handleRoot() {
   page += "</form></body></html>";
   server.send(200, "text/html", page);
 }
+
+  // --- Motor / relay control implementations ---
+  void startScheduledRun() {
+    if (motorRunActive) {
+      Serial.println("Scheduled run requested but motor already running");
+      return;
+    }
+    Serial.println("Starting scheduled motor run: activating relay");
+    setRelayActive();
+    motorRunActive = true;
+    scheduledPressCount = 0;
+    if (currentScheduleIndex >= 0 && currentScheduleIndex < 3) {
+      currentScheduleSteps = schedule[currentScheduleIndex].steps;
+    } else {
+      currentScheduleSteps = STEPS_PER_RUN;
+    }
+    scheduledRunStart = millis();
+  }
+
+  void stopMotor() {
+    Serial.println("Stopping motor (relay inactive)");
+    setRelayInactive();
+    motorRunActive = false;
+    scheduledPressCount = 0;
+    relayPulseActive = false;
+    scheduledRunStart = 0;
+    currentScheduleIndex = -1;
+    currentScheduleSteps = 0;
+    lastMotorStop = millis();
+  }
+
+  void setRelayActive() {
+    digitalWrite(RELAY_PIN, HIGH); // active HIGH for this hardware
+    Serial.println("Relay set ACTIVE (HIGH)");
+  }
+
+  void setRelayInactive() {
+    digitalWrite(RELAY_PIN, LOW); // inactive LOW
+    Serial.println("Relay set INACTIVE (LOW)");
+  }
 
 void handleSave() {
   if (!server.hasArg("ssid")) {
@@ -399,6 +424,7 @@ void checkSchedule() {
       int today = timeinfo.tm_yday; // day of year
       if (schedule[i].lastTriggeredDay != today) {
         Serial.printf("Scheduled time reached: %02d:%02d -> starting motor run\n", curHour, curMinute);
+        currentScheduleIndex = i;
         startScheduledRun();
         schedule[i].lastTriggeredDay = today;
       } else {
@@ -406,37 +432,51 @@ void checkSchedule() {
       }
     }
   }
+
 }
 
-void startScheduledRun() {
-  if (motorRunActive) {
-    Serial.println("Scheduled run requested but motor already running");
-    return;
+void handleConfigSave() {
+  Preferences prefs;
+  prefs.begin("schedule", false);
+  for (int i = 0; i < 3; ++i) {
+    String hs = server.arg("h" + String(i));
+    String ms = server.arg("m" + String(i));
+    String ss = server.arg("s" + String(i));
+    int h = hs.length() ? hs.toInt() : schedule[i].hour;
+    int m = ms.length() ? ms.toInt() : schedule[i].minute;
+    int s = ss.length() ? ss.toInt() : schedule[i].steps;
+    schedule[i].hour = h;
+    schedule[i].minute = m;
+    schedule[i].steps = s;
+    prefs.putUInt((String("h") + i).c_str(), h);
+    prefs.putUInt((String("m") + i).c_str(), m);
+    prefs.putUInt((String("s") + i).c_str(), s);
   }
-  Serial.println("Starting scheduled motor run: activating relay");
-  setRelayActive(); // active LOW keeps motor running
-  motorRunActive = true;
-  scheduledPressCount = 0;
-  scheduledRunStart = millis();
+  prefs.end();
+  server.send(200, "text/html", "Saved schedule. Reloading...<script>setTimeout(()=>location='/config',500);</script>");
 }
 
-void stopMotor() {
-  Serial.println("Stopping motor (relay HIGH)");
-  setRelayInactive();
-  motorRunActive = false;
-  scheduledPressCount = 0;
-  relayPulseActive = false;
-  scheduledRunStart = 0;
-  lastMotorStop = millis();
+void loadScheduleFromPrefs() {
+  Preferences prefs;
+  prefs.begin("schedule", true);
+  for (int i = 0; i < 3; ++i) {
+    unsigned int h = prefs.getUInt((String("h") + i).c_str(), schedule[i].hour);
+    unsigned int m = prefs.getUInt((String("m") + i).c_str(), schedule[i].minute);
+    unsigned int s = prefs.getUInt((String("s") + i).c_str(), schedule[i].steps);
+    schedule[i].hour = h;
+    schedule[i].minute = m;
+    schedule[i].steps = s;
+  }
+  prefs.end();
 }
 
-// Relay helper wrappers
-void setRelayActive() {
-  digitalWrite(RELAY_PIN, HIGH); // active HIGH
-  Serial.println("Relay set ACTIVE (HIGH)");
-}
-
-void setRelayInactive() {
-  digitalWrite(RELAY_PIN, LOW); // inactive LOW
-  Serial.println("Relay set INACTIVE (LOW)");
+void handleConfigRoot() {
+  String page = "<html><body><h2>Feeding schedule</h2><form method='POST' action='/config/save'>";
+  for (int i = 0; i < 3; ++i) {
+    page += "Zeit " + String(i+1) + ": <input name='h" + String(i) + "' size=2 value='" + String(schedule[i].hour) + "'>:";
+    page += "<input name='m" + String(i) + "' size=2 value='" + String(schedule[i].minute) + "'> ";
+    page += "Schritte: <input name='s" + String(i) + "' size=2 value='" + String(schedule[i].steps) + "'><br>";
+  }
+  page += "<input type='submit' value='Save'></form></body></html>";
+  server.send(200, "text/html", page);
 }
