@@ -19,6 +19,13 @@ const uint8_t RELAY_PIN = 22;   // relay pin set to GPIO22 (active LOW)
 const unsigned long RELAY_PULSE_MS = 5000UL; // relay active time in ms (2s)
 const uint8_t REQUIRED_PRESSES = 3; // how many rising edges trigger the relay
 const uint8_t STEPS_PER_RUN = 3; // how many switch activations per scheduled motor run
+const bool ENABLE_MANUAL_TRIGGER = false; // if true, 3 presses will trigger a manual pulse
+
+// Safety / timing
+const unsigned long SCHEDULED_RUN_MAX_MS = 60UL * 1000UL; // max time for a scheduled run (failsafe)
+const unsigned long MOTOR_STOP_COOLDOWN_MS = 3000UL; // don't restart motor in this many ms after stopping
+static unsigned long scheduledRunStart = 0;
+static unsigned long lastMotorStop = 0;
 
 // WiFi / NTP (fill these)
 const char* WIFI_SSID = "FRITZ6.3";
@@ -30,7 +37,7 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 struct ScheduledTime { uint8_t hour; uint8_t minute; int lastTriggeredDay; };
 ScheduledTime schedule[3] = {
   {8, 0, -1},
-  {13, 0, -1},
+  {15, 41, -1},
   {18, 0, -1}
 };
 
@@ -114,8 +121,17 @@ bool readSwitchRisingEdge() {
 
 // Start a manual relay pulse if not already active and not in a scheduled run
 void startRelayPulse() {
+  if (!ENABLE_MANUAL_TRIGGER) {
+    Serial.println("Manual trigger disabled in configuration");
+    return;
+  }
   if (motorRunActive) {
     Serial.println("Manual pulse requested but scheduled run active - ignoring");
+    return;
+  }
+  // respect cooldown after motor stop
+  if ((millis() - lastMotorStop) < MOTOR_STOP_COOLDOWN_MS) {
+    Serial.println("Manual trigger ignored due to motor stop cooldown");
     return;
   }
   if (!relayPulseActive) {
@@ -136,6 +152,15 @@ void updateRelayPulse() {
       digitalWrite(RELAY_PIN, HIGH); // deactivate relay
       relayPulseActive = false;
       Serial.println("Manual relay pulse ended, relay set HIGH (inactive)");
+      lastMotorStop = millis();
+    }
+  }
+  // Scheduled run timeout check
+  if (motorRunActive && scheduledRunStart > 0) {
+    if ((millis() - scheduledRunStart) >= SCHEDULED_RUN_MAX_MS) {
+      Serial.println("Scheduled run timeout reached - stopping motor as failsafe");
+      stopMotor();
+      lastMotorStop = millis();
     }
   }
 }
@@ -159,13 +184,15 @@ void loop() {
       if (scheduledPressCount >= STEPS_PER_RUN) {
         Serial.println("Scheduled run completed: stopping motor/relay");
         // Ensure relay is deactivated
-        digitalWrite(RELAY_PIN, HIGH);
-        motorRunActive = false;
-        scheduledPressCount = 0;
+        stopMotor();
       }
     } else {
-      pressCount++;
-      Serial.printf("Switch rising edge detected, count=%d\n", pressCount);
+      if (ENABLE_MANUAL_TRIGGER) {
+        pressCount++;
+        Serial.printf("Switch rising edge detected, count=%d\n", pressCount);
+      } else {
+        Serial.println("Switch rising edge ignored (manual trigger disabled)");
+      }
     }
   }
 
@@ -371,6 +398,7 @@ void startScheduledRun() {
   digitalWrite(RELAY_PIN, LOW); // active LOW keeps motor running
   motorRunActive = true;
   scheduledPressCount = 0;
+  scheduledRunStart = millis();
 }
 
 void stopMotor() {
@@ -379,4 +407,6 @@ void stopMotor() {
   motorRunActive = false;
   scheduledPressCount = 0;
   relayPulseActive = false;
+  scheduledRunStart = 0;
+  lastMotorStop = millis();
 }
