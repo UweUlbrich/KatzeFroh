@@ -1,0 +1,18 @@
+{
+  // Empfohlene Einstellungen für GitHub Copilot & C++/PlatformIO
+  "github.copilot.enable": {
+    "workspace": true
+  },
+  // Inline-Vorschläge aktivieren (nützlich für schnelle C++ Ergänzungen)
+  "editor.inlineSuggest.enabled": true,
+  // Vorschläge zeigen, ohne dass Tab automatisch annimmt
+  "github.copilot.suggestionDelay": 50,
+  // Format on save für C/C++ (falls du das möchtest)
+  "[cpp]": {
+    "editor.formatOnSave": false
+  },
+  // PlatformIO: Terminal verwenden zum Upload/Monitor
+  "platformio-ide.customMonitor": {
+    "baudRate": 115200
+  }
+}
