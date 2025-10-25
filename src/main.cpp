@@ -20,6 +20,7 @@ const unsigned long RELAY_PULSE_MS = 5000UL; // relay active time in ms (2s)
 const uint8_t REQUIRED_PRESSES = 3; // how many rising edges trigger the relay
 const uint8_t STEPS_PER_RUN = 3; // how many switch activations per scheduled motor run
 const bool ENABLE_MANUAL_TRIGGER = false; // if true, 3 presses will trigger a manual pulse
+const bool RUN_SELF_TEST = false; // set true to run the audible relay self-test at boot
 
 // Safety / timing
 const unsigned long SCHEDULED_RUN_MAX_MS = 60UL * 1000UL; // max time for a scheduled run (failsafe)
@@ -37,7 +38,7 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 struct ScheduledTime { uint8_t hour; uint8_t minute; int lastTriggeredDay; };
 ScheduledTime schedule[3] = {
   {8, 0, -1},
-  {15, 41, -1},
+  {16, 40, -1},
   {18, 0, -1}
 };
 
@@ -55,6 +56,8 @@ void stopMotor();
 void startConfigPortal();
 void handleRoot();
 void handleSave();
+void setRelayActive();
+void setRelayInactive();
 
 // Function prototypes
 void setupPins();
@@ -64,8 +67,23 @@ void updateRelayPulse();
 void updateLed();
 
 void setup() {
+  // Initialize relay pin as early as possible to avoid accidental activation during boot
+  pinMode(RELAY_PIN, OUTPUT);
+  // Ensure relay is inactive at boot (HIGH=active, LOW=inactive after polarity flip)
+  setRelayInactive();
+  delay(20);
   Serial.begin(115200);
-  delay(10);
+  delay(100);
+  if (RUN_SELF_TEST) {
+    Serial.println("Relay self-test: activating briefly (2 cycles)");
+    setRelayActive();
+    delay(2000);
+    setRelayInactive();
+    delay(2000);
+    setRelayActive();
+    delay(2000);
+    setRelayInactive();
+  }
   setupPins();
   connectToWiFi();
   initTime();
@@ -90,7 +108,8 @@ void setupPins() {
   pinMode(SWITCH_PIN, INPUT_PULLDOWN);
   // Relay pin
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH); // start with relay HIGH (inactive). Relay is driven LOW for activation.
+  setRelayInactive(); // ensure relay inactive after setup
+  Serial.println("Pins initialized");
 }
 
 // Read the switch with debounce and count rising edges. Returns true if a rising edge was detected.
@@ -136,7 +155,7 @@ void startRelayPulse() {
   }
   if (!relayPulseActive) {
     Serial.println("3 presses reached -> activating manual relay pulse (LOW for configured time)");
-    digitalWrite(RELAY_PIN, LOW); // active LOW
+  setRelayActive();
     relayPulseActive = true;
     relayPulseStart = millis();
   } else {
@@ -149,7 +168,7 @@ void updateRelayPulse() {
   // Only auto-manage manual pulses when not in a scheduled run
   if (relayPulseActive && !motorRunActive) {
     if ((millis() - relayPulseStart) >= RELAY_PULSE_MS) {
-      digitalWrite(RELAY_PIN, HIGH); // deactivate relay
+  setRelayInactive();
       relayPulseActive = false;
       Serial.println("Manual relay pulse ended, relay set HIGH (inactive)");
       lastMotorStop = millis();
@@ -395,7 +414,7 @@ void startScheduledRun() {
     return;
   }
   Serial.println("Starting scheduled motor run: activating relay");
-  digitalWrite(RELAY_PIN, LOW); // active LOW keeps motor running
+  setRelayActive(); // active LOW keeps motor running
   motorRunActive = true;
   scheduledPressCount = 0;
   scheduledRunStart = millis();
@@ -403,10 +422,21 @@ void startScheduledRun() {
 
 void stopMotor() {
   Serial.println("Stopping motor (relay HIGH)");
-  digitalWrite(RELAY_PIN, HIGH);
+  setRelayInactive();
   motorRunActive = false;
   scheduledPressCount = 0;
   relayPulseActive = false;
   scheduledRunStart = 0;
   lastMotorStop = millis();
+}
+
+// Relay helper wrappers
+void setRelayActive() {
+  digitalWrite(RELAY_PIN, HIGH); // active HIGH
+  Serial.println("Relay set ACTIVE (HIGH)");
+}
+
+void setRelayInactive() {
+  digitalWrite(RELAY_PIN, LOW); // inactive LOW
+  Serial.println("Relay set INACTIVE (LOW)");
 }
