@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
+#include <WebServer.h>
+#include <Preferences.h>
 
 // Blink the onboard LED of the AZ-Delivery / Wemos D1 Mini ESP32
 // On many ESP32 D1 mini boards the onboard LED is connected to GPIO 2.
@@ -41,6 +43,9 @@ static int lastCheckedMinute = -1;
 void connectToWiFi();
 void initTime();
 void checkSchedule();
+void startConfigPortal();
+void handleRoot();
+void handleSave();
 
 // Function prototypes
 void setupPins();
@@ -170,32 +175,141 @@ void loop() {
 
 // Connect to WiFi (non-blocking wait)
 void connectToWiFi() {
-  if (strlen(WIFI_SSID) == 0 || strcmp(WIFI_SSID, "YOUR_SSID") == 0) {
-    Serial.println("WiFi SSID not configured. Please set WIFI_SSID and WIFI_PASS in src/main.cpp");
+  // First try stored credentials from Preferences
+  Preferences prefs;
+  prefs.begin("wifi", true);
+  String storedSsid = prefs.getString("ssid", "");
+  String storedPass = prefs.getString("pass", "");
+  prefs.end();
+
+  if (storedSsid.length() > 0) {
+    Serial.printf("Found stored credentials SSID=%s\n", storedSsid.c_str());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(storedSsid.c_str(), storedPass.c_str());
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
+      delay(200);
+      Serial.print('.');
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi connected (stored credentials)");
+      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+      return;
+    } else {
+      Serial.println("Stored credentials didn't connect");
+    }
+  }
+
+  // Next try compile-time credentials if provided
+  if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_SSID") != 0) {
+    Serial.printf("Trying compile-time credentials SSID=%s\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    unsigned long start2 = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start2) < 10000) {
+      delay(200);
+      Serial.print('.');
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi connected (compile-time credentials)");
+      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+      return;
+    } else {
+      Serial.println("Compile-time credentials didn't connect");
+    }
+  }
+
+  // If we got here, no usable credentials or connection failed -> start config portal
+  Serial.println("Starting AP config portal to set WiFi credentials");
+  startConfigPortal();
+}
+
+// Global web server instance for config portal
+WebServer server(80);
+
+// Simple captive-style AP web portal to enter WiFi credentials
+void startConfigPortal() {
+  const char* apName = "KatzeFroh-Setup";
+  Serial.printf("Starting AP '%s'\n", apName);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apName);
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.printf("AP IP: %s\n", apIP.toString().c_str());
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+
+  // Start server and handle requests until credentials saved
+  server.begin();
+  Serial.println("Config portal started. Connect to the AP and open http://192.168.4.1/");
+
+  unsigned long portalStart = millis();
+  bool saved = false;
+  while (!saved && (millis() - portalStart) < 300000) { // 5 minutes
+    server.handleClient();
+    delay(10);
+    // check a flag in Preferences to see if saved
+    Preferences prefs;
+    prefs.begin("wifi", true);
+    String ssid = prefs.getString("ssid", "");
+    prefs.end();
+    if (ssid.length() > 0) saved = true;
+  }
+
+  server.stop();
+  Serial.println("Config portal stopped");
+  // attempt to reconnect if saved
+  Preferences prefs2;
+  prefs2.begin("wifi", true);
+  String newSsid = prefs2.getString("ssid", "");
+  String newPass = prefs2.getString("pass", "");
+  prefs2.end();
+  if (newSsid.length() > 0) {
+    Serial.printf("Trying new credentials SSID=%s\n", newSsid.c_str());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(newSsid.c_str(), newPass.c_str());
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
+      delay(200);
+      Serial.print('.');
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi connected (new credentials)");
+      Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+      Serial.println("New credentials failed to connect");
+    }
+  }
+}
+
+// Handlers use Preferences to save credentials.
+void handleRoot() {
+  String page = "<html><body><h2>KatzeFroh WiFi Setup</h2>";
+  page += "<form method='POST' action='/save'>";
+  page += "SSID: <input name='ssid' length=32><br>";
+  page += "Password: <input name='pass' length=64><br>";
+  page += "<input type='submit' value='Save'>";
+  page += "</form></body></html>";
+  server.send(200, "text/html", page);
+}
+
+void handleSave() {
+  if (!server.hasArg("ssid")) {
+    server.send(400, "text/plain", "ssid missing");
     return;
   }
-  Serial.printf("Connecting to WiFi SSID=%s\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
-    delay(200);
-    Serial.print('.');
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi connected");
-    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("WiFi not connected (continuing without time sync)");
-    // Do a quick scan and print nearby SSIDs to help diagnose
-    int n = WiFi.scanNetworks();
-    Serial.printf("Found %d networks:\n", n);
-    for (int i = 0; i < n; ++i) {
-      Serial.printf("  %d: %s (RSSI=%d) %s\n", i, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "SECURE");
-    }
-    WiFi.scanDelete();
-  }
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+  server.send(200, "text/html", "Saved. The device will try to connect. You can close this page.");
 }
 
 // Initialize time via SNTP (if WiFi is connected)
