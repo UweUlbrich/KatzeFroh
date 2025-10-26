@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include <SPIFFS.h>
 #include <ESPmDNS.h>
+#include <esp_system.h>
 
 // forward declare server (defined later) so handlers above can use it
 extern WebServer server;
@@ -103,8 +104,10 @@ static unsigned long lastMotorStop = 0;
 // WiFi / NTP (fill these)
 const char* WIFI_SSID = "FRITZ6.3";
 const char* WIFI_PASS = "Cool2:home::";
-const long GMT_OFFSET_SEC = 7200; // adjust to your timezone (seconds)
-const int DAYLIGHT_OFFSET_SEC = 0;
+// Timezone configuration: use a POSIX TZ string so DST is applied automatically.
+// Example below is for Central European Time (CET/CEST). Adjust if needed.
+// POSIX TZ example: "CET-1CEST,M3.5.0/02:00:00,M10.5.0/03:00:00"
+const char* TZ_RULE = "CET-1CEST,M3.5.0/02:00:00,M10.5.0/03:00:00";
 
 // Scheduled times (hour, minute)
 struct ScheduledTime { uint8_t hour; uint8_t minute; uint8_t steps; int lastTriggeredDay; };
@@ -124,6 +127,7 @@ static int lastCheckedMinute = -1;
 // Function prototypes (extended)
 void connectToWiFi();
 void initTime();
+void setupWifiEventHandler();
 void checkSchedule();
 void startScheduledRun();
 void stopMotor();
@@ -159,9 +163,30 @@ void setup() {
   delay(20);
   Serial.begin(115200);
   delay(200);
+  // Log reset reason early so we can spot brownouts/restarts
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    // convert to human readable
+    const char* rrs = "";
+    switch (rr) {
+      case ESP_RST_UNKNOWN: rrs = "UNKNOWN"; break;
+      case ESP_RST_POWERON: rrs = "POWERON"; break;
+      case ESP_RST_EXT: rrs = "EXTERNAL_RESET"; break;
+      case ESP_RST_SW: rrs = "SOFTWARE_RESET"; break;
+      case ESP_RST_PANIC: rrs = "PANIC"; break;
+      case ESP_RST_INT_WDT: rrs = "INT_WDT"; break;
+      case ESP_RST_TASK_WDT: rrs = "TASK_WDT"; break;
+      case ESP_RST_WDT: rrs = "WDT"; break;
+      case ESP_RST_DEEPSLEEP: rrs = "DEEPSLEEP_RESET"; break;
+      case ESP_RST_BROWNOUT: rrs = "BROWNOUT"; break;
+      case ESP_RST_SDIO: rrs = "SDIO_RESET"; break;
+      default: rrs = "OTHER"; break;
+    }
+    logMessage("INFO", String("Reset reason: ") + rrs);
+  }
   // Initialize SPIFFS so we can log to file
   if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed");
+    logMessage("ERROR", "SPIFFS mount failed");
   } else {
     // SPIFFS ready; will log this below using logMessage
   }
@@ -177,6 +202,8 @@ void setup() {
     setRelayInactive();
   }
   setupPins();
+  // Register WiFi event handler to log connect/disconnect and re-init time/mDNS
+  setupWifiEventHandler();
   connectToWiFi();
   initTime();
   // Load any saved schedule from Preferences before starting portal
@@ -250,7 +277,7 @@ void startRelayPulse() {
   }
   // respect cooldown after motor stop
   if ((millis() - lastMotorStop) < MOTOR_STOP_COOLDOWN_MS) {
-    Serial.println("Manual trigger ignored due to motor stop cooldown");
+    logMessage("DEBUG", "Manual trigger ignored due to motor stop cooldown");
     return;
   }
   if (!relayPulseActive) {
@@ -512,13 +539,16 @@ void handleWifiSave() {
   server.send(200, "text/html", "Saved. The device will try to connect. You can close this page.");
 }
 
-// Initialize time via SNTP (if WiFi is connected)
+// Initialize time via SNTP (if WiFi is connected) and apply TZ/DST rules
 void initTime() {
   if (WiFi.status() != WL_CONNECTED) return;
-  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
-  Serial.println("Waiting for time sync...");
+  // Use configTzTime so the system honors the provided TZ_RULE (POSIX format)
+  configTzTime(TZ_RULE, "pool.ntp.org", "time.nist.gov");
+  logMessage("INFO", String("Time zone set: ") + TZ_RULE);
+  logMessage("INFO", "Waiting for time sync...");
   time_t now = time(nullptr);
   unsigned long start = millis();
+  // Wait up to 10s for time to be set
   while (now < 8 * 3600 * 2 && (millis() - start) < 10000) {
     delay(200);
     now = time(nullptr);
@@ -554,7 +584,7 @@ void checkSchedule() {
         startScheduledRun();
         schedule[i].lastTriggeredDay = today;
       } else {
-        Serial.println("Scheduled time already triggered today");
+        logMessage("DEBUG", "Scheduled time already triggered today");
       }
     }
   }
@@ -585,7 +615,24 @@ void handleConfigSave() {
     prefs.putUInt((String("s") + i).c_str(), s);
   }
   prefs.end();
-  server.send(200, "text/html", "Saved schedule. Reloading...<script>setTimeout(()=>location='/config',500);</script>");
+  // Log the saved schedule (times and portion counts)
+  {
+    String logMsg = "Saved schedule:";
+    for (int i = 0; i < 3; ++i) {
+      char buf[32];
+      snprintf(buf, sizeof(buf), " [%d] %02d:%02d x%d", i+1, schedule[i].hour, schedule[i].minute, schedule[i].steps);
+      logMsg += String(buf);
+    }
+    logMessage("INFO", logMsg);
+  }
+
+  // Respond with a small page that shows a toast notification and then redirects
+  String resp = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  resp += "<title>Saved</title>";
+  resp += "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:0;background:transparent} .toast{position:fixed;left:50%;top:20%;transform:translateX(-50%);background:#333;color:#fff;padding:12px 18px;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,0.12);font-weight:600} </style>";
+  resp += "</head><body><div class='toast'>Einstellungen gespeichert</div>";
+  resp += "<script>setTimeout(()=>{location='/config';},700);</script></body></html>";
+  server.send(200, "text/html", resp);
 }
 
 void loadScheduleFromPrefs() {
@@ -614,7 +661,7 @@ void handleConfigRoot() {
   }
   body += "<div style='margin-top:12px'><button type='submit'>Speichern</button></div>";
   body += "</form>";
-  body += "<p><a href='/'>Home</a> · <a href='/wifi'>WLAN</a> · <a href='/log'>Log</a></p>";
+  body += "<p><a href='/'>Home</a> - <a href='/wifi'>WLAN</a> - <a href='/log'>Log</a></p>";
   String page = buildPage("KatzeFroh - Zeitplan", body);
   server.send(200, "text/html", page);
 }
@@ -642,4 +689,31 @@ String buildPage(const String &title, const String &body) {
   css += body;
   css += "</div></body></html>";
   return css;
+}
+
+// Register WiFi event handler to log events and re-init time/mDNS when IP is obtained
+void setupWifiEventHandler() {
+  WiFi.onEvent([](WiFiEvent_t event) {
+    switch (event) {
+      case SYSTEM_EVENT_STA_GOT_IP:
+        logMessage("INFO", String("WiFi GOT IP: ") + WiFi.localIP().toString());
+        // re-init time and (re)start mDNS if needed
+        initTime();
+        if (!mdnsStarted) {
+          if (MDNS.begin("katzefroh")) {
+            logMessage("INFO", "mDNS responder started (event): http://katzefroh.local");
+            mdnsStarted = true;
+          } else {
+            logMessage("WARN", "mDNS responder failed to start (event)");
+          }
+        }
+        break;
+      case SYSTEM_EVENT_STA_DISCONNECTED:
+        logMessage("WARN", "WiFi disconnected");
+        break;
+      default:
+        // ignore other events
+        break;
+    }
+  });
 }
