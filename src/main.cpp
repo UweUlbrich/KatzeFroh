@@ -4,6 +4,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
+#include <ESPmDNS.h>
 
 // forward declare server (defined later) so handlers above can use it
 extern WebServer server;
@@ -136,6 +137,7 @@ void handleConfigRoot();
 void handleConfigSave();
 void loadScheduleFromPrefs();
 void saveScheduleToPrefs();
+String buildPage(const String &title, const String &body);
 
 // Function prototypes
 void setupPins();
@@ -147,6 +149,7 @@ void updateLed();
 // Global web server instance for config portal
 WebServer server(80);
 static bool configPortalRunning = false;
+static bool mdnsStarted = false;
 
 void setup() {
   // Initialize relay pin as early as possible to avoid accidental activation during boot
@@ -351,6 +354,15 @@ void connectToWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
       logMessage("INFO", "WiFi connected (stored credentials)");
       logMessage("INFO", String("IP: ") + WiFi.localIP().toString());
+      // start mDNS responder
+      if (!mdnsStarted) {
+        if (MDNS.begin("katzefroh")) {
+          logMessage("INFO", "mDNS responder started: http://katzefroh.local");
+          mdnsStarted = true;
+        } else {
+          logMessage("WARN", "mDNS responder failed to start");
+        }
+      }
       return;
     } else {
       logMessage("WARN", "Stored credentials didn't connect");
@@ -371,6 +383,15 @@ void connectToWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
       logMessage("INFO", "WiFi connected (compile-time credentials)");
       logMessage("INFO", String("IP: ") + WiFi.localIP().toString());
+      // start mDNS responder
+      if (!mdnsStarted) {
+        if (MDNS.begin("katzefroh")) {
+          logMessage("INFO", "mDNS responder started: http://katzefroh.local");
+          mdnsStarted = true;
+        } else {
+          logMessage("WARN", "mDNS responder failed to start");
+        }
+      }
       return;
     } else {
       logMessage("WARN", "Compile-time credentials didn't connect");
@@ -411,6 +432,15 @@ void startConfigPortal() {
     IPAddress apIP = WiFi.softAPIP();
   logMessage("INFO", String("AP IP: ") + apIP.toString());
   logMessage("INFO", "Config portal started on AP. Connect and open http://192.168.4.1/");
+    // start mDNS responder on AP IP as well if possible
+    if (!mdnsStarted) {
+      if (MDNS.begin("katzefroh")) {
+        logMessage("INFO", "mDNS responder started on AP: http://katzefroh.local");
+        mdnsStarted = true;
+      } else {
+        logMessage("WARN", "mDNS responder failed to start on AP");
+      }
+    }
   } else {
   logMessage("INFO", String("Config portal started on STA IP: ") + WiFi.localIP().toString());
   }
@@ -418,23 +448,22 @@ void startConfigPortal() {
 
 // Handlers use Preferences to save credentials.
 void handleWifiRoot() {
-  String page = "<html><body><h2>KatzeFroh WiFi Setup</h2>";
-  // post to /wifi/save (route moved)
-  page += "<form method='POST' action='/wifi/save'>";
-  page += "SSID: <input name='ssid' length=32><br>";
-  page += "Password: <input name='pass' length=64><br>";
-  page += "<input type='submit' value='Save'>";
-  page += "</form></body></html>";
+  String body = "<form method='POST' action='/wifi/save'>";
+  body += "SSID: <input name='ssid' length=32><br>";
+  body += "Password: <input name='pass' length=64><br>";
+  body += "<input type='submit' value='Save'>";
+  body += "</form><p><a href='/'>Home</a></p>";
+  String page = buildPage("WLAN konfigurieren", body);
   server.send(200, "text/html", page);
 }
 
   // --- Motor / relay control implementations ---
   void startScheduledRun() {
     if (motorRunActive) {
-      Serial.println("Scheduled run requested but motor already running");
+      logMessage("WARN", "Scheduled run requested but motor already running");
       return;
     }
-    Serial.println("Starting scheduled motor run: activating relay");
+    logMessage("INFO", "Starting scheduled motor run: activating relay");
     setRelayActive();
     motorRunActive = true;
     scheduledPressCount = 0;
@@ -447,7 +476,7 @@ void handleWifiRoot() {
   }
 
   void stopMotor() {
-    Serial.println("Stopping motor (relay inactive)");
+    logMessage("INFO", "Stopping motor (relay inactive)");
     setRelayInactive();
     motorRunActive = false;
     scheduledPressCount = 0;
@@ -460,12 +489,12 @@ void handleWifiRoot() {
 
   void setRelayActive() {
     digitalWrite(RELAY_PIN, HIGH); // active HIGH for this hardware
-    Serial.println("Relay set ACTIVE (HIGH)");
+    logMessage("INFO", "Relay set ACTIVE (HIGH)");
   }
 
   void setRelayInactive() {
     digitalWrite(RELAY_PIN, LOW); // inactive LOW
-    Serial.println("Relay set INACTIVE (LOW)");
+    logMessage("INFO", "Relay set INACTIVE (LOW)");
   }
 
 void handleWifiSave() {
@@ -536,12 +565,18 @@ void handleConfigSave() {
   Preferences prefs;
   prefs.begin("schedule", false);
   for (int i = 0; i < 3; ++i) {
-    String hs = server.arg("h" + String(i));
-    String ms = server.arg("m" + String(i));
+    String t = server.arg("t" + String(i)); // expected HH:MM
     String ss = server.arg("s" + String(i));
-    int h = hs.length() ? hs.toInt() : schedule[i].hour;
-    int m = ms.length() ? ms.toInt() : schedule[i].minute;
+    int h = schedule[i].hour;
+    int m = schedule[i].minute;
     int s = ss.length() ? ss.toInt() : schedule[i].steps;
+    if (t.length() >= 4) {
+      int colon = t.indexOf(':');
+      if (colon > 0) {
+        h = t.substring(0, colon).toInt();
+        m = t.substring(colon + 1).toInt();
+      }
+    }
     schedule[i].hour = h;
     schedule[i].minute = m;
     schedule[i].steps = s;
@@ -568,24 +603,43 @@ void loadScheduleFromPrefs() {
 }
 
 void handleConfigRoot() {
-  String page = "<html><body><h2>KatzeFroh - Zeitplan</h2><form method='POST' action='/config/save'>";
+  String body = "<form method='POST' action='/config/save'>";
   for (int i = 0; i < 3; ++i) {
-    page += "Zeit " + String(i+1) + ": <input name='h" + String(i) + "' size=2 value='" + String(schedule[i].hour) + "'>:";
-    page += "<input name='m" + String(i) + "' size=2 value='" + String(schedule[i].minute) + "'> ";
-    page += "Portionen: <input name='s" + String(i) + "' size=2 value='" + String(schedule[i].steps) + "'><br>";
+    char defaultTime[6];
+    snprintf(defaultTime, sizeof(defaultTime), "%02d:%02d", schedule[i].hour, schedule[i].minute);
+    body += "<label>Zeit " + String(i+1) + "</label>";
+    body += "<input type='time' name='t" + String(i) + "' value='" + String(defaultTime) + "' required>";
+    body += "<label>Portionen</label>";
+    body += "<input type='number' name='s" + String(i) + "' min='1' max='20' value='" + String(schedule[i].steps) + "' required><br><br>";
   }
-  page += "<input type='submit' value='Save'></form></body></html>";
-  page += "<p><a href='/wifi'>WiFi konfigurieren</a></p>";
+  body += "<div style='margin-top:12px'><button type='submit'>Speichern</button></div>";
+  body += "</form>";
+  body += "<p><a href='/'>Home</a> · <a href='/wifi'>WLAN</a> · <a href='/log'>Log</a></p>";
+  String page = buildPage("KatzeFroh - Zeitplan", body);
   server.send(200, "text/html", page);
 }
 
 // Root page: links to schedule config and WiFi setup
 void handleRoot() {
-  String page = "<html><body><h2>KatzeFroh</h2>";
-  page += "<ul>";
-  page += "<li><a href='/config'>Zeitplan konfigurieren</a></li>";
-  page += "<li><a href='/wifi'>WLAN konfigurieren</a></li>";
-  page += "</ul>";
-  page += "</body></html>";
+  String body = "<ul>";
+  body += "<li><a href='/config'>Zeitplan konfigurieren</a></li>";
+  body += "<li><a href='/wifi'>WLAN konfigurieren</a></li>";
+  body += "<li><a href='/log'>LOG ansehen</a></li>";
+  body += "</ul>";
+  String page = buildPage("KatzeFroh - Home", body);
   server.send(200, "text/html", page);
+}
+
+// Small HTML helper to wrap pages with CSS
+String buildPage(const String &title, const String &body) {
+  String css = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  css += "<title>" + title + "</title>";
+  css += "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:0;background:#f6f8fa;color:#111} ";
+  css += ".container{max-width:760px;margin:24px auto;background:#fff;padding:18px;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,0.06)}";
+  css += "h2{margin-top:0}label{display:block;margin:8px 0 4px;font-weight:600}input[type=time],input[type=number],input[type=text],select{width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box} .row{display:flex;gap:8px} .row> *{flex:1} button{background:#1976d2;color:#fff;padding:10px 14px;border:none;border-radius:6px;cursor:pointer} .muted{color:#666;font-size:0.9em} a{color:#1976d2}</style>";
+  css += "</head><body><div class='container'>";
+  css += "<h2>" + title + "</h2>";
+  css += body;
+  css += "</div></body></html>";
+  return css;
 }
